@@ -35,7 +35,7 @@ type Stack struct {
 	data []uint256.Int
 }
 
-func newstack() *Stack {
+func NewStack() *Stack {
 	return stackPool.Get().(*Stack)
 }
 
@@ -54,6 +54,10 @@ func (st *Stack) push(d *uint256.Int) {
 	st.data = append(st.data, *d)
 }
 
+func (st *Stack) Push(d *uint256.Int) {
+	st.push(d)
+}
+
 func (st *Stack) pop() (ret uint256.Int) {
 	ret = st.data[len(st.data)-1]
 	st.data = st.data[:len(st.data)-1]
@@ -62,6 +66,10 @@ func (st *Stack) pop() (ret uint256.Int) {
 
 func (st *Stack) len() int {
 	return len(st.data)
+}
+
+func (st *Stack) Len() int {
+	return st.len()
 }
 
 func (st *Stack) swap(n int) {

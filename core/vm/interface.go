@@ -88,11 +88,14 @@ type StateDB interface {
 // depends on this context being implemented for doing subcalls and initialising new EVM contracts.
 type CallContext interface {
 	// Call calls another contract.
-	Call(env *EVM, me ContractRef, addr common.Address, data []byte, gas, value *big.Int) ([]byte, error)
+	Call(env *EVM, me ContractRef, addr common.Address, data []byte, gas, value *big.Int) ([]byte, uint64, error)
 	// CallCode takes another contracts code and execute within our own context
-	CallCode(env *EVM, me ContractRef, addr common.Address, data []byte, gas, value *big.Int) ([]byte, error)
+	CallCode(env *EVM, me ContractRef, addr common.Address, data []byte, gas, value *big.Int) ([]byte, uint64, error)
 	// DelegateCall is same as CallCode except sender and value is propagated from parent to child scope
-	DelegateCall(env *EVM, me ContractRef, addr common.Address, data []byte, gas *big.Int) ([]byte, error)
+	DelegateCall(env *EVM, me ContractRef, addr common.Address, data []byte, gas *big.Int) ([]byte, uint64, error)
 	// Create creates a new contract
-	Create(env *EVM, me ContractRef, data []byte, gas, value *big.Int) ([]byte, common.Address, error)
+	Create(env *EVM, me ContractRef, data []byte, gas, value *big.Int) ([]byte, common.Address, uint64, error)
+
+	StaticCall(env *EVM, me ContractRef, addr common.Address, input []byte, gas *big.Int) ([]byte, uint64, error)
+	Create2(env *EVM, me ContractRef, code []byte, gas *big.Int, value *big.Int, salt *uint256.Int) ([]byte, common.Address, uint64, error)
 }

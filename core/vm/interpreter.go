@@ -18,6 +18,7 @@ package vm
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
@@ -82,8 +83,35 @@ func (ctx *ScopeContext) CallInput() []byte {
 	return ctx.Contract.Input
 }
 
-// EVMInterpreter represents an EVM interpreter
-type EVMInterpreter struct {
+// /////////////////////////////////////////////////////////////////////////////
+// Interpreter interface
+// EVMInterpreter defines an interface for different interpreter implementations.
+type EVMInterpreter interface {
+	// Run the contract's code with the given input data and returns the return byte-slice
+	// and an error if one occurred.
+	Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error)
+}
+
+type InterpreterFactory func(evm *EVM, cfg Config) EVMInterpreter
+
+var interpreter_registry = map[string]InterpreterFactory{}
+
+func RegisterInterpreterFactory(name string, factory InterpreterFactory) {
+	interpreter_registry[strings.ToLower(name)] = factory
+}
+
+func NewInterpreter(name string, evm *EVM, cfg Config) EVMInterpreter {
+	factory, found := interpreter_registry[strings.ToLower(name)]
+	if !found {
+		log.Error("no factory for interpreter registered", "name", name)
+	}
+	return factory(evm, cfg)
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// GethEVMInterpreter represents an EVM interpreter
+type GethEVMInterpreter struct {
 	evm   *EVM
 	table *JumpTable
 
@@ -94,8 +122,24 @@ type EVMInterpreter struct {
 	returnData []byte // Last CALL's return data for subsequent reuse
 }
 
+func (g *GethEVMInterpreter) SetLastCallReturnData(data []byte) {
+	g.returnData = data
+}
+
+func (g *GethEVMInterpreter) GetLastCallReturnData() []byte {
+	return g.returnData
+}
+
+func (g *GethEVMInterpreter) SetReadOnly(readOnly bool) {
+	g.readOnly = readOnly
+}
+
+func (g *GethEVMInterpreter) IsReadOnly() bool {
+	return g.readOnly
+}
+
 // NewEVMInterpreter returns a new instance of the Interpreter.
-func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
+func NewEVMInterpreter(evm *EVM) *GethEVMInterpreter {
 	// If jump table was not initialised we set the default one.
 	var table *JumpTable
 	switch {
@@ -138,7 +182,7 @@ func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
 		}
 	}
 	evm.Config.ExtraEips = extraEips
-	return &EVMInterpreter{evm: evm, table: table}
+	return &GethEVMInterpreter{evm: evm, table: table}
 }
 
 // Run loops and evaluates the contract's code with the given input data and returns
@@ -147,10 +191,10 @@ func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
 // It's important to note that any errors returned by the interpreter should be
 // considered a revert-and-consume-all-gas operation except for
 // ErrExecutionReverted which means revert-and-keep-gas-left.
-func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+func (in *GethEVMInterpreter) RunContract(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
 	// Increment the call depth which is restricted to 1024
-	in.evm.depth++
-	defer func() { in.evm.depth-- }()
+	in.evm.Depth++
+	defer func() { in.evm.Depth-- }()
 
 	// Make sure the readOnly is only set if we aren't in readOnly yet.
 	// This also makes sure that the readOnly flag isn't removed for child calls.
@@ -171,7 +215,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	var (
 		op          OpCode        // current opcode
 		mem         = NewMemory() // bound memory
-		stack       = newstack()  // local stack
+		stack       = NewStack()  // local stack
 		callContext = &ScopeContext{
 			Memory:   mem,
 			Stack:    stack,
@@ -203,10 +247,10 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 				return
 			}
 			if !logged && in.evm.Config.Tracer.OnOpcode != nil {
-				in.evm.Config.Tracer.OnOpcode(pcCopy, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
+				in.evm.Config.Tracer.OnOpcode(pcCopy, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.Depth, VMErrorFromErr(err))
 			}
 			if logged && in.evm.Config.Tracer.OnFault != nil {
-				in.evm.Config.Tracer.OnFault(pcCopy, byte(op), gasCopy, cost, callContext, in.evm.depth, VMErrorFromErr(err))
+				in.evm.Config.Tracer.OnFault(pcCopy, byte(op), gasCopy, cost, callContext, in.evm.Depth, VMErrorFromErr(err))
 			}
 		}()
 	}
@@ -270,7 +314,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 					in.evm.Config.Tracer.OnGasChange(gasCopy, gasCopy-cost, tracing.GasChangeCallOpCode)
 				}
 				if in.evm.Config.Tracer.OnOpcode != nil {
-					in.evm.Config.Tracer.OnOpcode(pc, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
+					in.evm.Config.Tracer.OnOpcode(pc, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.Depth, VMErrorFromErr(err))
 					logged = true
 				}
 			}
@@ -282,7 +326,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 				in.evm.Config.Tracer.OnGasChange(gasCopy, gasCopy-cost, tracing.GasChangeCallOpCode)
 			}
 			if in.evm.Config.Tracer.OnOpcode != nil {
-				in.evm.Config.Tracer.OnOpcode(pc, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
+				in.evm.Config.Tracer.OnOpcode(pc, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.Depth, VMErrorFromErr(err))
 				logged = true
 			}
 		}
@@ -300,4 +344,223 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	}
 
 	return res, err
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Abstracted interpreter with single step execution.
+
+// GethState represents the internal state of the interpreter.
+type GethState struct {
+	Contract *Contract // processed contract
+	Memory   *Memory   // bound memory
+	Stack    *Stack    // local stack
+	// For optimisation reason we're using uint64 as the program counter.
+	// It's theoretically possible to go above 2^64. The YP defines the PC
+	// to be uint256. Practically much less so feasible.
+	Pc          uint64 // program counter
+	Result      []byte // result of the opcode execution function
+	Err         error
+	CallContext *ScopeContext
+	ReadOnly    bool
+	Halted      bool
+
+	op   OpCode // current opcode
+	cost uint64
+
+	// copies used by tracer
+	pcCopy  uint64 // needed for the deferred Tracer
+	gasCopy uint64 // for Tracer to log gas remaining before execution
+	logged  bool   // deferred Tracer should ignore already logged steps
+}
+
+func NewGethState(contract *Contract, memory *Memory, stack *Stack, Pc uint64) *GethState {
+	return &GethState{
+		Contract: contract,
+		Memory:   memory,
+		Stack:    stack,
+		Pc:       Pc,
+		CallContext: &ScopeContext{
+			Memory:   memory,
+			Stack:    stack,
+			Contract: contract,
+		},
+	}
+}
+
+type InterpreterState struct {
+	Contract *Contract
+	Stack    *Stack
+	Memory   *Memory
+	pc       uint64
+	finished bool
+}
+
+func (in *GethEVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	state := InterpreterState{
+		Contract: contract,
+		Stack:    NewStack(),
+		Memory:   NewMemory(),
+	}
+	defer returnStack(state.Stack)
+	return in.run(&state, input, readOnly)
+}
+
+func (in *GethEVMInterpreter) run(state *InterpreterState, input []byte, readOnly bool) (ret []byte, err error) {
+	defer func() {
+		state.finished = true
+	}()
+
+	// Increment the call depth which is restricted to 1024
+	in.evm.Depth++
+	defer func() { in.evm.Depth-- }()
+
+	// Make sure the readOnly is only set if we aren't in readOnly yet.
+	// This also makes sure that the readOnly flag isn't removed for child calls.
+	if readOnly && !in.readOnly {
+		in.readOnly = true
+		defer func() { in.readOnly = false }()
+	}
+
+	// Reset the previous call's return data. It's unimportant to preserve the old buffer
+	// as every returning call will return new data anyway.
+	in.returnData = nil
+
+	// Don't bother with the execution if there's no code.
+	if len(state.Contract.Code) == 0 {
+		return nil, nil
+	}
+
+	gethState := NewGethState(state.Contract, state.Memory, state.Stack, state.pc)
+	gethState.Contract.Input = input
+
+	debug := in.evm.Config.Tracer != nil
+	var logged bool
+
+	if debug {
+		defer func() { // this deferred method handles exit-with-error
+			if err == nil {
+				return
+			}
+			if !logged && in.evm.Config.Tracer.OnOpcode != nil {
+				in.evm.Config.Tracer.OnOpcode(gethState.pcCopy, byte(gethState.op), gethState.gasCopy, gethState.cost, gethState.CallContext, in.returnData, in.evm.Depth, VMErrorFromErr(err))
+			}
+			if logged && in.evm.Config.Tracer.OnFault != nil {
+				in.evm.Config.Tracer.OnFault(gethState.pcCopy, byte(gethState.op), gethState.gasCopy, gethState.cost, gethState.CallContext, in.evm.Depth, VMErrorFromErr(err))
+			}
+		}()
+	}
+
+	// The Interpreter main run loop (contextual). This loop runs until either an
+	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
+	// the execution of one of the operations or until the done flag is set by the
+	// parent context.
+	steps := 0
+	for {
+		steps++
+		if in.evm.abort.Load() {
+			break
+		}
+
+		if !in.Step(gethState) {
+			break
+		}
+	}
+
+	if gethState.Err == errStopToken {
+		gethState.Err = nil // clear stop token error
+	}
+
+	return gethState.Result, gethState.Err
+}
+
+func (in *GethEVMInterpreter) Step(state *GethState) bool {
+	debug := in.evm.Config.Tracer != nil
+	if debug {
+		// Capture pre-execution values for tracing.
+		state.logged, state.pcCopy, state.gasCopy = false, state.Pc, state.Contract.Gas
+	}
+	// Get the operation from the jump table and validate the stack to ensure there are
+	// enough stack items available to perform the operation.
+	state.op = state.Contract.GetOp(state.Pc)
+	operation := in.table[state.op]
+	cost := operation.constantGas // For tracing
+	// Validate stack
+	if sLen := state.Stack.len(); sLen < operation.minStack {
+		state.Err = &ErrStackUnderflow{stackLen: sLen, required: operation.minStack}
+		return false
+
+	} else if sLen > operation.maxStack {
+		state.Err = &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
+		return false
+	}
+	if !state.Contract.UseGas(cost, in.evm.Config.Tracer, tracing.GasChangeIgnored) {
+		state.Err = ErrOutOfGas
+		return false
+	}
+
+	if operation.dynamicGas != nil {
+		// All ops with a dynamic memory usage also has a dynamic gas cost.
+		var memorySize uint64
+		// calculate the new memory size and expand the memory to fit
+		// the operation
+		// Memory check needs to be done prior to evaluating the dynamic gas portion,
+		// to detect calculation overflows
+		if operation.memorySize != nil {
+			memSize, overflow := operation.memorySize(state.Stack)
+			if overflow {
+				state.Err = ErrGasUintOverflow
+				return false
+			}
+			// memory is expanded in words of 32 bytes. Gas
+			// is also calculated in words.
+			if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
+				state.Err = ErrGasUintOverflow
+				return false
+			}
+		}
+		// Consume the gas and return an error if not enough gas is available.
+		// cost is explicitly set so that the capture state defer method can get the proper cost
+		var dynamicCost uint64
+		dynamicCost, state.Err = operation.dynamicGas(in.evm, state.Contract, state.Stack, state.Memory, memorySize)
+		cost += dynamicCost // for tracing
+		if state.Err != nil {
+			state.Err = fmt.Errorf("%w: %v", ErrOutOfGas, state.Err)
+			return false
+		}
+		if !state.Contract.UseGas(dynamicCost, in.evm.Config.Tracer, tracing.GasChangeIgnored) {
+			state.Err = ErrOutOfGas
+			return false
+		}
+
+		// Do tracing before memory expansion
+		if debug {
+			if in.evm.Config.Tracer.OnGasChange != nil {
+				in.evm.Config.Tracer.OnGasChange(state.gasCopy, state.gasCopy-cost, tracing.GasChangeCallOpCode)
+			}
+			if in.evm.Config.Tracer.OnOpcode != nil {
+				in.evm.Config.Tracer.OnOpcode(state.Pc, byte(state.op), state.gasCopy, cost, state.CallContext, in.returnData, in.evm.Depth, VMErrorFromErr(state.Err))
+				state.logged = true
+			}
+		}
+		if memorySize > 0 {
+			state.Memory.Resize(memorySize)
+		}
+	} else if debug {
+		if in.evm.Config.Tracer.OnGasChange != nil {
+			in.evm.Config.Tracer.OnGasChange(state.gasCopy, state.gasCopy-cost, tracing.GasChangeCallOpCode)
+		}
+		if in.evm.Config.Tracer.OnOpcode != nil {
+			in.evm.Config.Tracer.OnOpcode(state.Pc, byte(state.op), state.gasCopy, cost, state.CallContext, in.returnData, in.evm.Depth, VMErrorFromErr(state.Err))
+			state.logged = true
+		}
+	}
+
+	// execute the operation
+	state.Result, state.Err = operation.execute(&state.Pc, in, state.CallContext)
+	if state.Err != nil {
+		return false
+	}
+	state.Pc++
+
+	return state.Err == nil
 }
