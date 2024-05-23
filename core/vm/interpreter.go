@@ -230,7 +230,6 @@ func (in *EVMInterpreter) Step(state *GethState) bool {
 	if sLen := state.Stack.len(); sLen < operation.minStack {
 		state.Err = &ErrStackUnderflow{stackLen: sLen, required: operation.minStack}
 		return false
-
 	} else if sLen > operation.maxStack {
 		state.Err = &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
 		return false

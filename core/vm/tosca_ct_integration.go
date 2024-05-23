@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"math/big"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -57,21 +56,20 @@ func (g *EVMInterpreter) IsReadOnly() bool {
 }
 
 // CallContext Call interceptor
-
 // CallContext provides a basic interface for the EVM calling conventions. The EVM
 // depends on this context being implemented for doing subcalls and initialising new EVM contracts.
 type CallContextInterceptor interface {
 	// Call calls another contract.
-	Call(env *EVM, me ContractRef, addr common.Address, data []byte, gas, value *big.Int) ([]byte, uint64, error)
+	Call(env *EVM, me ContractRef, addr common.Address, data []byte, gas uint64, value *uint256.Int) ([]byte, uint64, error)
 	// CallCode takes another contracts code and execute within our own context
-	CallCode(env *EVM, me ContractRef, addr common.Address, data []byte, gas, value *big.Int) ([]byte, uint64, error)
+	CallCode(env *EVM, me ContractRef, addr common.Address, data []byte, gas uint64, value *uint256.Int) ([]byte, uint64, error)
 	// DelegateCall is same as CallCode except sender and value is propagated from parent to child scope
-	DelegateCall(env *EVM, me ContractRef, addr common.Address, data []byte, gas *big.Int) ([]byte, uint64, error)
+	DelegateCall(env *EVM, me ContractRef, addr common.Address, data []byte, gas uint64) ([]byte, uint64, error)
 	// Create creates a new contract
-	Create(env *EVM, me ContractRef, data []byte, gas, value *big.Int) ([]byte, common.Address, uint64, error)
+	Create(env *EVM, me ContractRef, data []byte, gas uint64, value *uint256.Int) ([]byte, common.Address, uint64, error)
 
-	StaticCall(env *EVM, me ContractRef, addr common.Address, input []byte, gas *big.Int) ([]byte, uint64, error)
-	Create2(env *EVM, me ContractRef, code []byte, gas *big.Int, value *big.Int, salt *uint256.Int) ([]byte, common.Address, uint64, error)
+	StaticCall(env *EVM, me ContractRef, addr common.Address, input []byte, gas uint64) ([]byte, uint64, error)
+	Create2(env *EVM, me ContractRef, code []byte, gas uint64, value *uint256.Int, salt *uint256.Int) ([]byte, common.Address, uint64, error)
 }
 
 // Interpreter interface
@@ -107,7 +105,6 @@ func init() {
 }
 
 // Abstracted interpreter with single step execution.
-
 // GethState represents the internal state of the interpreter.
 type GethState struct {
 	Contract *Contract // processed contract
