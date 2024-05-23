@@ -147,10 +147,24 @@ func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
 // It's important to note that any errors returned by the interpreter should be
 // considered a revert-and-consume-all-gas operation except for
 // ErrExecutionReverted which means revert-and-keep-gas-left.
-func (in *EVMInterpreter) run(state *InterpreterState, input []byte, readOnly bool) (ret []byte, err error) {
+func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	state := InterpreterState{
+		Contract: contract,
+		Stack:    newstack(),
+		Memory:   NewMemory(),
+		Input:    input,
+		ReadOnly: readOnly,
+	}
 	defer func() {
-		state.finished = true
+		returnStack(state.Stack)
 	}()
+	return in.run(&state, math.MaxUint64)
+}
+
+func (in *EVMInterpreter) run(state *InterpreterState, maxSteps uint64) (ret []byte, err error) {
+	contract := state.Contract
+	input := state.Input
+	readOnly := state.ReadOnly
 
 	// Increment the call depth which is restricted to 1024
 	in.evm.depth++
@@ -163,20 +177,38 @@ func (in *EVMInterpreter) run(state *InterpreterState, input []byte, readOnly bo
 		defer func() { in.readOnly = false }()
 	}
 
-	// Reset the previous call's return data. It's unimportant to preserve the old buffer
-	// as every returning call will return new data anyway.
-	in.returnData = nil
+	// Use the InterperterState`s last call return data. If this function is called in
+	// a regular run context, this will reset the return data to nil.
+	in.returnData = state.LastCallReturnData
 
 	// Don't bother with the execution if there's no code.
-	if len(state.Contract.Code) == 0 {
+	if len(contract.Code) == 0 {
 		return nil, nil
 	}
 
-	gethState := NewGethState(state.Contract, state.Memory, state.Stack, state.pc)
-	gethState.Contract.Input = input
+	var (
+		op          OpCode // current opcode
+		mem         = state.Memory
+		stack       = state.Stack
+		callContext = &ScopeContext{
+			Memory:   mem,
+			Stack:    stack,
+			Contract: contract,
+		}
+		// For optimisation reason we're using uint64 as the program counter.
+		// It's theoretically possible to go above 2^64. The YP defines the PC
+		// to be uint256. Practically much less so feasible.
+		pc   = state.Pc // program counter
+		cost uint64
+		// copies used by tracer
+		pcCopy  uint64 // needed for the deferred EVMLogger
+		gasCopy uint64 // for EVMLogger to log gas remaining before execution
+		logged  bool   // deferred EVMLogger should ignore already logged steps
+		res     []byte // result of the opcode execution function
+		debug   = in.evm.Config.Tracer != nil
+	)
 
-	debug := in.evm.Config.Tracer != nil
-	var logged bool
+	contract.Input = input
 
 	if debug {
 		defer func() { // this deferred method handles exit-with-error
@@ -184,124 +216,105 @@ func (in *EVMInterpreter) run(state *InterpreterState, input []byte, readOnly bo
 				return
 			}
 			if !logged && in.evm.Config.Tracer.OnOpcode != nil {
-				in.evm.Config.Tracer.OnOpcode(gethState.pcCopy, byte(gethState.op), gethState.gasCopy, gethState.cost, gethState.CallContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
+				in.evm.Config.Tracer.OnOpcode(pcCopy, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
 			}
 			if logged && in.evm.Config.Tracer.OnFault != nil {
-				in.evm.Config.Tracer.OnFault(gethState.pcCopy, byte(gethState.op), gethState.gasCopy, gethState.cost, gethState.CallContext, in.evm.depth, VMErrorFromErr(err))
+				in.evm.Config.Tracer.OnFault(pcCopy, byte(op), gasCopy, cost, callContext, in.evm.depth, VMErrorFromErr(err))
 			}
 		}()
 	}
-
 	// The Interpreter main run loop (contextual). This loop runs until either an
 	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
 	// the execution of one of the operations or until the done flag is set by the
-	// parent context.
-	steps := 0
-	for {
-		steps++
-		if in.evm.abort.Load() {
-			break
-		}
-
-		if !in.Step(gethState) {
-			break
-		}
-	}
-
-	if gethState.Err == errStopToken {
-		gethState.Err = nil // clear stop token error
-	}
-
-	return gethState.Result, gethState.Err
-}
-
-func (in *EVMInterpreter) Step(state *GethState) bool {
-	debug := in.evm.Config.Tracer != nil
-	if debug {
-		// Capture pre-execution values for tracing.
-		state.logged, state.pcCopy, state.gasCopy = false, state.Pc, state.Contract.Gas
-	}
-	// Get the operation from the jump table and validate the stack to ensure there are
-	// enough stack items available to perform the operation.
-	state.op = state.Contract.GetOp(state.Pc)
-	operation := in.table[state.op]
-	cost := operation.constantGas // For tracing
-	// Validate stack
-	if sLen := state.Stack.len(); sLen < operation.minStack {
-		state.Err = &ErrStackUnderflow{stackLen: sLen, required: operation.minStack}
-		return false
-	} else if sLen > operation.maxStack {
-		state.Err = &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
-		return false
-	}
-	if !state.Contract.UseGas(cost, in.evm.Config.Tracer, tracing.GasChangeIgnored) {
-		state.Err = ErrOutOfGas
-		return false
-	}
-
-	if operation.dynamicGas != nil {
-		// All ops with a dynamic memory usage also has a dynamic gas cost.
-		var memorySize uint64
-		// calculate the new memory size and expand the memory to fit
-		// the operation
-		// Memory check needs to be done prior to evaluating the dynamic gas portion,
-		// to detect calculation overflows
-		if operation.memorySize != nil {
-			memSize, overflow := operation.memorySize(state.Stack)
-			if overflow {
-				state.Err = ErrGasUintOverflow
-				return false
-			}
-			// memory is expanded in words of 32 bytes. Gas
-			// is also calculated in words.
-			if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
-				state.Err = ErrGasUintOverflow
-				return false
-			}
-		}
-		// Consume the gas and return an error if not enough gas is available.
-		// cost is explicitly set so that the capture state defer method can get the proper cost
-		var dynamicCost uint64
-		dynamicCost, state.Err = operation.dynamicGas(in.evm, state.Contract, state.Stack, state.Memory, memorySize)
-		cost += dynamicCost // for tracing
-		if state.Err != nil {
-			state.Err = fmt.Errorf("%w: %v", ErrOutOfGas, state.Err)
-			return false
-		}
-		if !state.Contract.UseGas(dynamicCost, in.evm.Config.Tracer, tracing.GasChangeIgnored) {
-			state.Err = ErrOutOfGas
-			return false
-		}
-
-		// Do tracing before memory expansion
+	// parent context. It also may stop after a given step limit for testing.
+	for steps := uint64(0); steps < maxSteps; steps++ {
 		if debug {
+			// Capture pre-execution values for tracing.
+			logged, pcCopy, gasCopy = false, pc, contract.Gas
+		}
+		// Get the operation from the jump table and validate the stack to ensure there are
+		// enough stack items available to perform the operation.
+		op = contract.GetOp(pc)
+		operation := in.table[op]
+		cost = operation.constantGas // For tracing
+		// Validate stack
+		if sLen := stack.len(); sLen < operation.minStack {
+			return nil, &ErrStackUnderflow{stackLen: sLen, required: operation.minStack}
+		} else if sLen > operation.maxStack {
+			return nil, &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
+		}
+		if !contract.UseGas(cost, in.evm.Config.Tracer, tracing.GasChangeIgnored) {
+			return nil, ErrOutOfGas
+		}
+
+		if operation.dynamicGas != nil {
+			// All ops with a dynamic memory usage also has a dynamic gas cost.
+			var memorySize uint64
+			// calculate the new memory size and expand the memory to fit
+			// the operation
+			// Memory check needs to be done prior to evaluating the dynamic gas portion,
+			// to detect calculation overflows
+			if operation.memorySize != nil {
+				memSize, overflow := operation.memorySize(stack)
+				if overflow {
+					return nil, ErrGasUintOverflow
+				}
+				// memory is expanded in words of 32 bytes. Gas
+				// is also calculated in words.
+				if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
+					return nil, ErrGasUintOverflow
+				}
+			}
+			// Consume the gas and return an error if not enough gas is available.
+			// cost is explicitly set so that the capture state defer method can get the proper cost
+			var dynamicCost uint64
+			dynamicCost, err = operation.dynamicGas(in.evm, contract, stack, mem, memorySize)
+			cost += dynamicCost // for tracing
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrOutOfGas, err)
+			}
+			if !contract.UseGas(dynamicCost, in.evm.Config.Tracer, tracing.GasChangeIgnored) {
+				return nil, ErrOutOfGas
+			}
+
+			// Do tracing before memory expansion
+			if debug {
+				if in.evm.Config.Tracer.OnGasChange != nil {
+					in.evm.Config.Tracer.OnGasChange(gasCopy, gasCopy-cost, tracing.GasChangeCallOpCode)
+				}
+				if in.evm.Config.Tracer.OnOpcode != nil {
+					in.evm.Config.Tracer.OnOpcode(pc, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
+					logged = true
+				}
+			}
+			if memorySize > 0 {
+				mem.Resize(memorySize)
+			}
+		} else if debug {
 			if in.evm.Config.Tracer.OnGasChange != nil {
-				in.evm.Config.Tracer.OnGasChange(state.gasCopy, state.gasCopy-cost, tracing.GasChangeCallOpCode)
+				in.evm.Config.Tracer.OnGasChange(gasCopy, gasCopy-cost, tracing.GasChangeCallOpCode)
 			}
 			if in.evm.Config.Tracer.OnOpcode != nil {
-				in.evm.Config.Tracer.OnOpcode(state.Pc, byte(state.op), state.gasCopy, cost, state.CallContext, in.returnData, in.evm.depth, VMErrorFromErr(state.Err))
-				state.logged = true
+				in.evm.Config.Tracer.OnOpcode(pc, byte(op), gasCopy, cost, callContext, in.returnData, in.evm.depth, VMErrorFromErr(err))
+				logged = true
 			}
 		}
-		if memorySize > 0 {
-			state.Memory.Resize(memorySize)
+
+		// execute the operation
+		res, err = operation.execute(&pc, in, callContext)
+		if err != nil {
+			break
 		}
-	} else if debug {
-		if in.evm.Config.Tracer.OnGasChange != nil {
-			in.evm.Config.Tracer.OnGasChange(state.gasCopy, state.gasCopy-cost, tracing.GasChangeCallOpCode)
-		}
-		if in.evm.Config.Tracer.OnOpcode != nil {
-			in.evm.Config.Tracer.OnOpcode(state.Pc, byte(state.op), state.gasCopy, cost, state.CallContext, in.returnData, in.evm.depth, VMErrorFromErr(state.Err))
-			state.logged = true
-		}
+		pc++
 	}
 
-	// execute the operation
-	state.Result, state.Err = operation.execute(&state.Pc, in, state.CallContext)
-	if state.Err != nil {
-		return false
-	}
-	state.Pc++
+	// Copy information back into passed Interpreter state.
+	state.Pc = pc
+	state.Error = err
 
-	return state.Err == nil
+	if err == errStopToken {
+		err = nil // clear stop token error
+	}
+
+	return res, err
 }
