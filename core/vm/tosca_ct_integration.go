@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -38,23 +39,6 @@ func (evm *EVM) SetDepth(depth int) {
 	evm.depth = depth
 }
 
-// Interpreter
-func (g *EVMInterpreter) SetLastCallReturnData(data []byte) {
-	g.returnData = data
-}
-
-func (g *EVMInterpreter) GetLastCallReturnData() []byte {
-	return g.returnData
-}
-
-func (g *EVMInterpreter) SetReadOnly(readOnly bool) {
-	g.readOnly = readOnly
-}
-
-func (g *EVMInterpreter) IsReadOnly() bool {
-	return g.readOnly
-}
-
 // CallContext Call interceptor
 // CallContext provides a basic interface for the EVM calling conventions. The EVM
 // depends on this context being implemented for doing subcalls and initialising new EVM contracts.
@@ -72,8 +56,9 @@ type CallContextInterceptor interface {
 	Create2(env *EVM, me ContractRef, code []byte, gas uint64, value *uint256.Int, salt *uint256.Int) ([]byte, common.Address, uint64, error)
 }
 
-// Interpreter interface
-// EVMInterpreter defines an interface for different interpreter implementations.
+// -- Interpreter Implementation Registry --
+
+// GethEVMInterpreter defines an interface for different interpreter implementations.
 type GethEVMInterpreter interface {
 	// Run the contract's code with the given input data and returns the return byte-slice
 	// and an error if one occurred.
@@ -105,58 +90,46 @@ func init() {
 }
 
 // Abstracted interpreter with single step execution.
-// GethState represents the internal state of the interpreter.
-type GethState struct {
-	Contract *Contract // processed contract
-	Memory   *Memory   // bound memory
-	Stack    *Stack    // local stack
-	// For optimisation reason we're using uint64 as the program counter.
-	// It's theoretically possible to go above 2^64. The YP defines the PC
-	// to be uint256. Practically much less so feasible.
-	Pc          uint64 // program counter
-	Result      []byte // result of the opcode execution function
-	Err         error
-	CallContext *ScopeContext
-	ReadOnly    bool
-	Halted      bool
 
-	op   OpCode // current opcode
-	cost uint64
+type Status int
 
-	// copies used by tracer
-	pcCopy  uint64 // needed for the deferred Tracer
-	gasCopy uint64 // for Tracer to log gas remaining before execution
-	logged  bool   // deferred Tracer should ignore already logged steps
-}
+const (
+	Running Status = iota
+	Reverted
+	Stopped
+	Failed
+)
 
-func NewGethState(contract *Contract, memory *Memory, stack *Stack, Pc uint64) *GethState {
-	return &GethState{
-		Contract: contract,
-		Memory:   memory,
-		Stack:    stack,
-		Pc:       Pc,
-		CallContext: &ScopeContext{
-			Memory:   memory,
-			Stack:    stack,
-			Contract: contract,
-		},
-	}
-}
-
+// InterpreterState is a snapshot of the EVM state that can be used to test the effects of
+// running single operations.
 type InterpreterState struct {
-	Contract *Contract
-	Stack    *Stack
-	Memory   *Memory
-	pc       uint64
-	finished bool
+	Contract           *Contract
+	Status             Status
+	Input              []byte
+	ReadOnly           bool
+	Stack              *Stack
+	Memory             *Memory
+	Pc                 uint64
+	Error              error
+	LastCallReturnData []byte
+	ReturnData         []byte
 }
 
-func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
-	state := InterpreterState{
-		Contract: contract,
-		Stack:    NewStack(),
-		Memory:   NewMemory(),
+func (in *EVMInterpreter) Step(state *InterpreterState) {
+	// run a single operation
+	res, err := in.run(state, 1)
+	if errors.Is(err, ErrExecutionReverted) {
+		state.Status = Reverted
+		state.ReturnData = res
+	} else if errors.Is(state.Error, errStopToken) {
+		state.Status = Stopped
+		state.ReturnData = res
+	} else if err != nil {
+		state.Status = Failed
+	} else {
+		state.Status = Running
 	}
-	defer returnStack(state.Stack)
-	return in.run(&state, input, readOnly)
+
+	// extract internal interpreter state
+	state.LastCallReturnData = in.returnData
 }
