@@ -116,15 +116,16 @@ type EVM struct {
 	// virtual machine configuration options used to initialise the
 	// evm.
 	Config Config
-	// global (to this context) ethereum virtual machine
-	// used throughout the execution of the tx.
-	interpreter *EVMInterpreter
 	// abort is used to abort the EVM calling operations
 	abort atomic.Bool
 	// callGasTemp holds the gas available for the current call. This is needed because the
 	// available gas is calculated in gasCall* according to the 63/64 rule and later
 	// applied in opCall*.
 	callGasTemp uint64
+
+	// global (to this context) ethereum virtual machine
+	// used throughout the execution of the tx.
+	interpreter Interpreter
 
 	// An optional override to intercept EVM calls.
 	CallInterceptor CallContextInterceptor
@@ -152,7 +153,7 @@ func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig
 		chainConfig: chainConfig,
 		chainRules:  chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time),
 	}
-	evm.interpreter = NewEVMInterpreter(evm)
+	evm.interpreter = NewInterpreter(config.InterpreterImpl, evm, config)
 	return evm
 }
 
@@ -175,7 +176,7 @@ func (evm *EVM) Cancelled() bool {
 }
 
 // Interpreter returns the current interpreter
-func (evm *EVM) Interpreter() *EVMInterpreter {
+func (evm *EVM) Interpreter() Interpreter {
 	return evm.interpreter
 }
 

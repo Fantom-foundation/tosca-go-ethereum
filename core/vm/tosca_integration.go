@@ -2,15 +2,12 @@ package vm
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 )
-
-// Error
-var ErrStopToken = errStopToken
 
 // Gas table
 func MemoryGasCost(mem *Memory, wordSize uint64) (uint64, error) {
@@ -40,8 +37,9 @@ func (evm *EVM) SetDepth(depth int) {
 }
 
 // CallContext Call interceptor
-// CallContext provides a basic interface for the EVM calling conventions. The EVM
+// CallContextInterceptor provides a basic interface for the EVM calling conventions. The EVM
 // depends on this context being implemented for doing subcalls and initialising new EVM contracts.
+// Based on ethereum's CallContext Interface
 type CallContextInterceptor interface {
 	// Call calls another contract.
 	Call(env *EVM, me ContractRef, addr common.Address, data []byte, gas uint64, value *uint256.Int) ([]byte, uint64, error)
@@ -51,21 +49,22 @@ type CallContextInterceptor interface {
 	DelegateCall(env *EVM, me ContractRef, addr common.Address, data []byte, gas uint64) ([]byte, uint64, error)
 	// Create creates a new contract
 	Create(env *EVM, me ContractRef, data []byte, gas uint64, value *uint256.Int) ([]byte, common.Address, uint64, error)
-
-	StaticCall(env *EVM, me ContractRef, addr common.Address, input []byte, gas uint64) ([]byte, uint64, error)
+	// Create2 creates a new contract with a deterministic address
 	Create2(env *EVM, me ContractRef, code []byte, gas uint64, value *uint256.Int, salt *uint256.Int) ([]byte, common.Address, uint64, error)
+	// StaticCall executes a contract in read-only mode
+	StaticCall(env *EVM, me ContractRef, addr common.Address, input []byte, gas uint64) ([]byte, uint64, error)
 }
 
 // -- Interpreter Implementation Registry --
 
-// GethEVMInterpreter defines an interface for different interpreter implementations.
-type GethEVMInterpreter interface {
+// Interpreter defines an interface for different interpreter implementations.
+type Interpreter interface {
 	// Run the contract's code with the given input data and returns the return byte-slice
 	// and an error if one occurred.
 	Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error)
 }
 
-type InterpreterFactory func(evm *EVM, cfg Config) GethEVMInterpreter
+type InterpreterFactory func(evm *EVM, cfg Config) Interpreter
 
 var interpreter_registry = map[string]InterpreterFactory{}
 
@@ -73,23 +72,23 @@ func RegisterInterpreterFactory(name string, factory InterpreterFactory) {
 	interpreter_registry[strings.ToLower(name)] = factory
 }
 
-func NewInterpreter(name string, evm *EVM, cfg Config) GethEVMInterpreter {
+func NewInterpreter(name string, evm *EVM, cfg Config) Interpreter {
 	factory, found := interpreter_registry[strings.ToLower(name)]
 	if !found {
-		log.Error("no factory for interpreter registered", "name", name)
+		panic(fmt.Sprintf("no factory for interpreter %s registered", name))
 	}
 	return factory(evm, cfg)
 }
 
 func init() {
-	factory := func(evm *EVM, cfg Config) GethEVMInterpreter {
+	factory := func(evm *EVM, cfg Config) Interpreter {
 		return NewEVMInterpreter(evm)
 	}
 	RegisterInterpreterFactory("", factory)
 	RegisterInterpreterFactory("geth", factory)
 }
 
-// Abstracted interpreter with single step execution.
+// --- Abstracted interpreter with step execution ---
 
 type Status int
 
