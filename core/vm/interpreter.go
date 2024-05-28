@@ -33,6 +33,8 @@ type Config struct {
 	NoBaseFee               bool  // Forces the EIP-1559 baseFee to 0 (needed for 0 price calls)
 	EnablePreimageRecording bool  // Enables recording of SHA3/keccak preimages
 	ExtraEips               []int // Additional EIPS that are to be enabled
+
+	InterpreterImpl string // The interpreter implementation to use
 }
 
 // ScopeContext contains the things that are per-call, such as stack and memory,
@@ -148,6 +150,24 @@ func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
 // considered a revert-and-consume-all-gas operation except for
 // ErrExecutionReverted which means revert-and-keep-gas-left.
 func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	state := InterpreterState{
+		Contract: contract,
+		Stack:    newstack(),
+		Memory:   NewMemory(),
+		Input:    input,
+		ReadOnly: readOnly,
+	}
+	defer func() {
+		returnStack(state.Stack)
+	}()
+	return in.run(&state, math.MaxUint64)
+}
+
+func (in *EVMInterpreter) run(state *InterpreterState, maxSteps uint64) (ret []byte, err error) {
+	contract := state.Contract
+	input := state.Input
+	readOnly := state.ReadOnly
+
 	// Increment the call depth which is restricted to 1024
 	in.evm.depth++
 	defer func() { in.evm.depth-- }()
@@ -159,9 +179,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		defer func() { in.readOnly = false }()
 	}
 
-	// Reset the previous call's return data. It's unimportant to preserve the old buffer
-	// as every returning call will return new data anyway.
-	in.returnData = nil
+	// Use the InterperterState`s last call return data. If this function is called in
+	// a regular run context, this will reset the return data to nil.
+	in.returnData = state.LastCallReturnData
 
 	// Don't bother with the execution if there's no code.
 	if len(contract.Code) == 0 {
@@ -169,9 +189,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	}
 
 	var (
-		op          OpCode        // current opcode
-		mem         = NewMemory() // bound memory
-		stack       = newstack()  // local stack
+		op          OpCode // current opcode
+		mem         = state.Memory
+		stack       = state.Stack
 		callContext = &ScopeContext{
 			Memory:   mem,
 			Stack:    stack,
@@ -180,7 +200,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		// For optimisation reason we're using uint64 as the program counter.
 		// It's theoretically possible to go above 2^64. The YP defines the PC
 		// to be uint256. Practically much less so feasible.
-		pc   = uint64(0) // program counter
+		pc   = state.Pc // program counter
 		cost uint64
 		// copies used by tracer
 		pcCopy  uint64 // needed for the deferred EVMLogger
@@ -189,12 +209,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		res     []byte // result of the opcode execution function
 		debug   = in.evm.Config.Tracer != nil
 	)
-	// Don't move this deferred function, it's placed before the OnOpcode-deferred method,
-	// so that it gets executed _after_: the OnOpcode needs the stacks before
-	// they are returned to the pools
-	defer func() {
-		returnStack(stack)
-	}()
+
 	contract.Input = input
 
 	if debug {
@@ -213,8 +228,8 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	// The Interpreter main run loop (contextual). This loop runs until either an
 	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
 	// the execution of one of the operations or until the done flag is set by the
-	// parent context.
-	for {
+	// parent context. It also may stop after a given step limit for testing.
+	for steps := uint64(0); steps < maxSteps; steps++ {
 		if debug {
 			// Capture pre-execution values for tracing.
 			logged, pcCopy, gasCopy = false, pc, contract.Gas
@@ -294,6 +309,10 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		}
 		pc++
 	}
+
+	// Copy information back into passed Interpreter state.
+	state.Pc = pc
+	state.Error = err
 
 	if err == errStopToken {
 		err = nil // clear stop token error
